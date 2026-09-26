@@ -27,6 +27,7 @@ from line_control.runtime.errors import (
     UnknownReferenceError,
 )
 from line_control.runtime.keys import scope_key
+from line_control.store.records import Record
 from line_control.store.stream import RecordStream
 
 STAGES = ("idle", "start", "ramp", "full", "coast")
@@ -34,6 +35,14 @@ RESETTABLE = ("coast",)
 SEQUENCE = "compressor"
 BASELINE_NAME = "efficiency"
 RECALIBRATE_SUBJECT = "compressor.recalibrate"
+DEFAULT_MAX_LOAD = 100
+DEFAULT_MARGIN_FLOOR = 0.05
+# Bleed demand law of the surge protection: the demand sits at the base
+# opening while the margin holds at the floor, opens further as the margin
+# falls through the floor and backs off once the margin clears the floor by
+# a full proportional band.
+SURGE_BASE_OPENING = 60
+SURGE_PROPORTIONAL_BAND = 0.25
 
 
 @dataclass(frozen=True)
@@ -87,10 +96,12 @@ class CompressorController:
         """Declare the tunable limits and the stage sequence of one unit."""
         scope = self.scope(unit)
         self._registry.declare(
-            ParameterSpec(scope, "max_load", "int", 100, Bounds(0, 100), "percent")
+            ParameterSpec(scope, "max_load", "int", DEFAULT_MAX_LOAD, Bounds(0, 100), "percent")
         )
         self._registry.declare(
-            ParameterSpec(scope, "margin_floor", "float", 0.05, Bounds(0.0, 0.5), "ratio")
+            ParameterSpec(
+                scope, "margin_floor", "float", DEFAULT_MARGIN_FLOOR, Bounds(0.0, 0.5), "ratio"
+            )
         )
         self._board.sequence(SEQUENCE, STAGES, resettable=RESETTABLE)
 
@@ -113,13 +124,20 @@ class CompressorController:
         """Return every recorded stage move of a unit."""
         return self.sequence().history(unit)
 
+    def _durable_record(self, unit: str) -> Record | None:
+        """Return the committed durable marker of a unit, if one exists."""
+        return self._stream.visible_view().current(scope_key("compressor", unit, "durable"))
+
     def durable(self, unit: str) -> bool:
         """Report whether a committed compressor state exists for a unit."""
-        return True
+        return self._durable_record(unit) is not None
 
     def durable_mark(self, unit: str) -> int:
         """Return the watermark the durable marker points at."""
-        return 0
+        record = self._durable_record(unit)
+        if record is None:
+            return 0
+        return int(record.payload.get("mark", 0))
 
     def persisted_state(self, unit: str) -> dict[str, Any]:
         """Return the state that was written by the last persist call."""
@@ -131,11 +149,11 @@ class CompressorController:
 
     def max_load(self, unit: str) -> int:
         """Return the load ceiling of a unit."""
-        return 100
+        return int(self._limit(unit, "max_load", DEFAULT_MAX_LOAD))
 
     def margin_floor(self, unit: str) -> float:
         """Return the margin below which the bleed valve is driven open."""
-        return 0.05
+        return float(self._limit(unit, "margin_floor", DEFAULT_MARGIN_FLOOR))
 
     # ------------------------------------------------------------- baselines
     def publish_default_baseline(self, unit: str) -> Baseline:
@@ -167,12 +185,14 @@ class CompressorController:
 
     def margin(self, unit: str, load: int) -> float:
         """Return the surge margin at a load using the fresh baseline."""
-        return surge_line(int(load)) * -1.0
+        return self.baseline(unit).value_at(int(load)) - surge_line(int(load))
 
     # ------------------------------------------------------------- surge math
     def surge_target(self, unit: str, load: int) -> int:
         """Return the minimum bleed opening the surge margin calls for."""
-        return 0
+        deficit = self.margin_floor(unit) - self.margin(unit, load)
+        target = SURGE_BASE_OPENING + 100.0 * deficit / SURGE_PROPORTIONAL_BAND
+        return int(min(100, max(0, round(target))))
 
     def surge_demand(self, unit: str, load: int, current: int) -> int:
         """Return the bleed demand, never asking for less than the current opening."""
@@ -181,11 +201,19 @@ class CompressorController:
 
     def record_surge(self, unit: str) -> int:
         """Count one surge event against a unit."""
-        return 0
+        count = self.surge_count(unit) + 1
+        record = self._stream.append(
+            "compressor.surge",
+            scope_key("compressor", unit, "surge"),
+            {"unit": unit, "count": count},
+        )
+        self._stream.commit_upto(record.seq)
+        return count
 
     def surge_count(self, unit: str) -> int:
         """Return how many surge events a unit has recorded."""
-        return 0
+        query = RecordQuery(unit=unit, kind="compressor.surge")
+        return len(query.apply(self._stream.visible()))
 
     # ----------------------------------------------------------- write paths
     def persist(self, unit: str, stage: str, load: int, rotor_rpm: int) -> PersistReceipt:
@@ -262,7 +290,10 @@ class CompressorController:
     # --------------------------------------------------------------- summary
     def ramp_target(self, unit: str) -> int:
         """Return the load the compressor is currently aiming at."""
-        return 0
+        persisted = self.persisted_state(unit)
+        if not persisted:
+            return 0
+        return int(persisted.get("load", 0))
 
     def state(self, unit: str) -> dict[str, Any]:
         """Return a snapshot of the compressor module for one unit."""
