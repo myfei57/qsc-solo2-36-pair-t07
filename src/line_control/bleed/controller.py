@@ -154,4 +154,5 @@ class BleedController:
 
     def follow_demand(self, unit: str, demand: int) -> dict[str, Any]:
         """Follow an automatic surge demand, never closing below it."""
-        return self.adjust(unit, "surge", min(int(demand), TRAVEL_HIGH))
+        opening = max(int(demand), self.position(unit))
+        return self.adjust(unit, "surge", min(opening, TRAVEL_HIGH))

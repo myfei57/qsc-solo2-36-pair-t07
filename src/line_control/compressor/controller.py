@@ -34,6 +34,10 @@ RESETTABLE = ("coast",)
 SEQUENCE = "compressor"
 BASELINE_NAME = "efficiency"
 RECALIBRATE_SUBJECT = "compressor.recalibrate"
+# The surge controller holds a base bleed opening and adds opening in
+# proportion to how far the measured margin sits below the configured floor.
+SURGE_BASE_OPENING = 60
+SURGE_GAIN = 400
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,9 @@ class CompressorController:
         """Return the parameter scope this module uses for a unit."""
         return scope_key("compressor", unit)
 
+    def _durable_key(self, unit: str) -> str:
+        return scope_key("compressor", unit, "durable")
+
     def declare_unit(self, unit: str) -> None:
         """Declare the tunable limits and the stage sequence of one unit."""
         scope = self.scope(unit)
@@ -115,11 +122,15 @@ class CompressorController:
 
     def durable(self, unit: str) -> bool:
         """Report whether a committed compressor state exists for a unit."""
-        return True
+        marker = self._stream.visible_view().current(self._durable_key(unit))
+        return marker is not None
 
     def durable_mark(self, unit: str) -> int:
         """Return the watermark the durable marker points at."""
-        return 0
+        marker = self._stream.visible_view().current(self._durable_key(unit))
+        if marker is None:
+            return 0
+        return int(marker.payload.get("mark", 0))
 
     def persisted_state(self, unit: str) -> dict[str, Any]:
         """Return the state that was written by the last persist call."""
@@ -131,11 +142,11 @@ class CompressorController:
 
     def max_load(self, unit: str) -> int:
         """Return the load ceiling of a unit."""
-        return 100
+        return int(self._limit(unit, "max_load", 100))
 
     def margin_floor(self, unit: str) -> float:
         """Return the margin below which the bleed valve is driven open."""
-        return 0.05
+        return float(self._limit(unit, "margin_floor", 0.05))
 
     # ------------------------------------------------------------- baselines
     def publish_default_baseline(self, unit: str) -> Baseline:
@@ -167,12 +178,16 @@ class CompressorController:
 
     def margin(self, unit: str, load: int) -> float:
         """Return the surge margin at a load using the fresh baseline."""
-        return surge_line(int(load)) * -1.0
+        value = self.baseline(unit).value_at(int(load))
+        return float(value) - surge_line(int(load))
 
     # ------------------------------------------------------------- surge math
     def surge_target(self, unit: str, load: int) -> int:
         """Return the minimum bleed opening the surge margin calls for."""
-        return 0
+        margin = self.margin(unit, int(load))
+        deficit = self.margin_floor(unit) - margin
+        target = SURGE_BASE_OPENING + SURGE_GAIN * deficit
+        return max(0, min(100, round(target)))
 
     def surge_demand(self, unit: str, load: int, current: int) -> int:
         """Return the bleed demand, never asking for less than the current opening."""
@@ -181,11 +196,22 @@ class CompressorController:
 
     def record_surge(self, unit: str) -> int:
         """Count one surge event against a unit."""
-        return 0
+        record = self._stream.append(
+            "compressor.surge",
+            scope_key("compressor", unit, "surge"),
+            {"unit": unit, "count": self.surge_count(unit) + 1},
+        )
+        self._stream.commit_upto(record.seq)
+        return self.surge_count(unit)
 
     def surge_count(self, unit: str) -> int:
         """Return how many surge events a unit has recorded."""
-        return 0
+        marker = self._stream.visible_view().current(
+            scope_key("compressor", unit, "surge")
+        )
+        if marker is None:
+            return 0
+        return int(marker.payload.get("count", 0))
 
     # ----------------------------------------------------------- write paths
     def persist(self, unit: str, stage: str, load: int, rotor_rpm: int) -> PersistReceipt:
@@ -220,7 +246,7 @@ class CompressorController:
         watermark = self._stream.commit_upto(first.seq)
         marker = self._stream.append(
             "compressor.durable",
-            scope_key("compressor", unit, "durable"),
+            self._durable_key(unit),
             {"unit": unit, "mark": watermark, "stage": stage},
         )
         self._stream.commit_upto(marker.seq)
